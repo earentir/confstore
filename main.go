@@ -286,8 +286,14 @@ func (s *FileStorage) showDiff(w http.ResponseWriter, r *http.Request) {
 
 func (s *FileStorage) getFileByVersion(r *http.Request) (*FileInfo, error) {
 	vars := mux.Vars(r)
+	// fmt.Println(r)
 	identifier := vars["identifier"]
 	versionStr := vars["version"]
+
+	if versionStr == "" {
+		versionStr = "1"
+	}
+	// fmt.Println("ident", identifier, "ver", versionStr)
 	version, err := strconv.Atoi(versionStr)
 	if err != nil {
 		return nil, fmt.Errorf("invalid version")
