@@ -35,8 +35,12 @@ type FileStorage struct {
 	JSONFile string
 }
 
+var (
+	storedConfPath = "storedconfs"
+)
+
 func main() {
-	err := os.MkdirAll("storedconfs", 0755)
+	err := os.MkdirAll(storedConfPath, 0755)
 	if err != nil {
 		log.Fatal("Error creating storedconfs directory: ", err)
 	}
@@ -239,7 +243,8 @@ func (s *FileStorage) downloadFile(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusNotFound)
 		return
 	}
-	fileData, err := readFileContent(fileInfo.ID + ".zip")
+
+	fileData, err := readFileContent(filepath.Join("storedconfs", fileInfo.ID+".zip"))
 	if err != nil {
 		http.Error(w, "Error reading file", http.StatusInternalServerError)
 		return
