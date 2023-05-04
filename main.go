@@ -37,9 +37,12 @@ type FileStorage struct {
 
 var (
 	storedConfPath = "storedconfs"
+	serverConfig   ServerConfig
 )
 
 func main() {
+	loadConfig()
+
 	err := os.MkdirAll(storedConfPath, 0755)
 	if err != nil {
 		log.Fatal("Error creating storedconfs directory: ", err)
@@ -92,6 +95,16 @@ func main() {
 	}
 
 	log.Println("Server stopped")
+
+	configBytes, err := json.Marshal(serverConfig)
+	if err != nil {
+		log.Fatal("Error encoding config file: ", err)
+	}
+
+	err = os.WriteFile(serverConfig.ConfigPath, configBytes, 0644)
+	if err != nil {
+		log.Fatal("Error writing config file: ", err)
+	}
 }
 
 func (s *FileStorage) saveFileStatus() {
@@ -352,4 +365,67 @@ func hashFile(data []byte) (string, string) {
 	md5Result := md5Hash.Sum(nil)
 
 	return hex.EncodeToString(sha1Result), hex.EncodeToString(md5Result)
+}
+
+func loadConfig() {
+	configData, err := os.ReadFile("config.json")
+	if err != nil {
+		if os.IsNotExist(err) {
+			serverConfig = ServerConfig{
+				Address:      "127.0.0.1",
+				Port:         8080,
+				ReadTimeout:  "30s",
+				WriteTimeout: "15s",
+				ConfigPath:   "config.json",
+			}
+			saveConfig()
+			return
+		}
+		log.Fatal("Error reading config file: ", err)
+	}
+
+	err = json.Unmarshal(configData, &serverConfig)
+	if err != nil {
+		log.Fatal("Error decoding config file: ", err)
+	}
+
+	if serverConfig.Address == "" {
+		serverConfig.Address = "127.0.0.1"
+	}
+	if serverConfig.Port == 0 {
+		serverConfig.Port = 8080
+	}
+	if serverConfig.ReadTimeout == "" {
+		serverConfig.ReadTimeout = "30s"
+	} else {
+		duration, err := time.ParseDuration(serverConfig.ReadTimeout)
+		if err != nil {
+			log.Fatal("Error parsing ReadTimeout: ", err)
+		}
+		serverConfig.ReadTimeout = duration.String()
+	}
+	if serverConfig.WriteTimeout == "" {
+		serverConfig.WriteTimeout = "15s"
+	} else {
+		duration, err := time.ParseDuration(serverConfig.WriteTimeout)
+		if err != nil {
+			log.Fatal("Error parsing WriteTimeout: ", err)
+		}
+		serverConfig.WriteTimeout = duration.String()
+	}
+	if serverConfig.ConfigPath == "" {
+		serverConfig.ConfigPath = "config.json"
+	}
+}
+
+func saveConfig() {
+	configBytes, err := json.Marshal(serverConfig)
+	if err != nil {
+		log.Fatal("Error encoding config file: ", err)
+	}
+
+	err = os.WriteFile(serverConfig.ConfigPath, configBytes, 0644)
+	if err != nil {
+		log.Fatal("Error writing config file: ", err)
+	}
 }
