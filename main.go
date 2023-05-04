@@ -45,6 +45,7 @@ func main() {
 	r.HandleFunc("/upload", storage.uploadFile).Methods("POST")
 	r.HandleFunc("/files", storage.listFiles).Methods("GET")
 	r.HandleFunc("/files/{identifier}", storage.downloadFile).Methods("GET")
+	r.HandleFunc("/files/{identifier}/versions/{version}", storage.downloadFileVersion).Methods("GET")
 	r.HandleFunc("/files/{identifier}/diff/{version}", storage.showDiff).Methods("GET")
 	r.HandleFunc("/hash/{hash}", storage.getFileByHash).Methods("GET")
 
@@ -57,11 +58,14 @@ func main() {
 		close(shutdownChannel)
 	}()
 
+	readTimeOutTemp, _ := time.ParseDuration(serverConfig.ReadTimeout)
+	writeTimeOutTemp, _ := time.ParseDuration(serverConfig.WriteTimeout)
+
 	srv := &http.Server{
 		Handler:      r,
-		Addr:         "127.0.0.1:8080",
-		WriteTimeout: 15 * time.Second,
-		ReadTimeout:  15 * time.Second,
+		Addr:         fmt.Sprintf("%s:%d", serverConfig.Address, serverConfig.Port),
+		WriteTimeout: writeTimeOutTemp,
+		ReadTimeout:  readTimeOutTemp,
 	}
 
 	go func() {
@@ -241,6 +245,36 @@ func (s *FileStorage) downloadFile(w http.ResponseWriter, r *http.Request) {
 	fileInfo, err := s.getFileByVersion(r)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusNotFound)
+		return
+	}
+
+	fileData, err := readFileContent(filepath.Join("storedconfs", fileInfo.ID+".zip"))
+	if err != nil {
+		http.Error(w, "Error reading file", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Disposition", "attachment; filename="+filepath.Base(fileInfo.ID))
+	w.Header().Set("Content-Type", "application/octet-stream")
+	io.WriteString(w, fileData)
+}
+
+func (s *FileStorage) downloadFileVersion(w http.ResponseWriter, r *http.Request) {
+	fileInfo, err := s.getFileByVersion(r)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusNotFound)
+		return
+	}
+
+	fileVersion := mux.Vars(r)["version"]
+	version, err := strconv.Atoi(fileVersion)
+	if err != nil {
+		http.Error(w, "Invalid version", http.StatusBadRequest)
+		return
+	}
+
+	if fileInfo.Version != version {
+		http.Error(w, "Version not found", http.StatusNotFound)
 		return
 	}
 
