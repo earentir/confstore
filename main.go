@@ -22,19 +22,6 @@ import (
 	"github.com/sergi/go-diff/diffmatchpatch"
 )
 
-type FileInfo struct {
-	ID         string `json:"id"`
-	Version    int    `json:"version"`
-	Identifier string `json:"identifier"`
-	Sha1       string `json:"sha1"`
-	Md5        string `json:"md5"`
-}
-
-type FileStorage struct {
-	Files    map[string][]FileInfo `json:"files"`
-	JSONFile string
-}
-
 var (
 	storedConfPath = "storedconfs"
 	serverConfig   ServerConfig
