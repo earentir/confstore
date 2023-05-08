@@ -1,53 +1,63 @@
 package main
 
 import (
-	"archive/zip"
 	"bytes"
 	"context"
-	"crypto/md5"
-	"crypto/sha1"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"io"
 	"log"
 	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/gorilla/mux"
-	"github.com/sergi/go-diff/diffmatchpatch"
-)
-
-var (
-	storedConfPath = "storedconfs"
-	serverConfig   ServerConfig
 )
 
 func main() {
-	loadConfig()
+	configuration, err := loadConfiguration()
+	if err != nil {
+		log.Fatal("Error loading configuration: ", err)
+	}
 
-	err := os.MkdirAll(storedConfPath, 0755)
+	err = os.MkdirAll(configuration.ConfPath, 0755)
 	if err != nil {
 		log.Fatal("Error creating storedconfs directory: ", err)
 	}
 
 	storage := &FileStorage{
-		Files:    make(map[string][]FileInfo),
-		JSONFile: "file_status.json",
+		Files: make([]FileInfo, 0),
 	}
-	storage.loadFileStatus()
+	storage.loadFileStatus(configuration)
+
+	if len(os.Args) > 1 {
+		if os.Args[1] == "rebuild" {
+			fmt.Println("Removing ", configuration.JSONFile)
+			err := os.Remove(configuration.JSONFile)
+			if err != nil {
+				log.Fatal("Error removing JSON file: ", err)
+			}
+
+			fmt.Println("Rebuilding file status from storedconfs directory")
+			err = storage.rebuildFileStatusFromStoredFiles()
+			if err != nil {
+				log.Fatal("Error rebuilding file status: ", err)
+			}
+			storage.saveFileStatus()
+			return
+		}
+	}
 
 	r := mux.NewRouter()
 	r.HandleFunc("/upload", storage.uploadFile).Methods("POST")
 	r.HandleFunc("/files", storage.listFiles).Methods("GET")
 	r.HandleFunc("/files/{identifier}", storage.downloadFile).Methods("GET")
-	r.HandleFunc("/files/{identifier}/versions/{version}", storage.downloadFileVersion).Methods("GET")
 	r.HandleFunc("/files/{identifier}/diff/{version}", storage.showDiff).Methods("GET")
 	r.HandleFunc("/hash/{hash}", storage.getFileByHash).Methods("GET")
+	r.HandleFunc("/files/{identifier}", storage.deleteFile).Methods("DELETE")
 
 	signalChannel := make(chan os.Signal, 1)
 	signal.Notify(signalChannel, os.Interrupt)
@@ -58,19 +68,20 @@ func main() {
 		close(shutdownChannel)
 	}()
 
-	readTimeOutTemp, _ := time.ParseDuration(serverConfig.ReadTimeout)
-	writeTimeOutTemp, _ := time.ParseDuration(serverConfig.WriteTimeout)
-
 	srv := &http.Server{
 		Handler:      r,
-		Addr:         fmt.Sprintf("%s:%d", serverConfig.Address, serverConfig.Port),
-		WriteTimeout: writeTimeOutTemp,
-		ReadTimeout:  readTimeOutTemp,
+		Addr:         fmt.Sprintf("%s:%s", configuration.ListenAddr, configuration.Port),
+		WriteTimeout: 15 * time.Second,
+		ReadTimeout:  15 * time.Second,
 	}
 
 	go func() {
 		log.Println("Starting server on", srv.Addr)
-		if err := srv.ListenAndServe(); err != nil {
+		if configuration.CertFile != "" && configuration.KeyFile != "" {
+			if err := srv.ListenAndServeTLS(configuration.CertFile, configuration.KeyFile); err != nil {
+				log.Fatal(err)
+			}
+		} else if err := srv.ListenAndServe(); err != nil {
 			log.Fatal(err)
 		}
 	}()
@@ -86,132 +97,82 @@ func main() {
 	}
 
 	log.Println("Server stopped")
-
-	configBytes, err := json.Marshal(serverConfig)
-	if err != nil {
-		log.Fatal("Error encoding config file: ", err)
-	}
-
-	err = os.WriteFile(serverConfig.ConfigPath, configBytes, 0644)
-	if err != nil {
-		log.Fatal("Error writing config file: ", err)
-	}
 }
 
-func (s *FileStorage) saveFileStatus() {
-	file, err := os.Create(s.JSONFile)
+func (s *FileStorage) rebuildFileStatusFromStoredFiles() error {
+	files, err := os.ReadDir(s.Configuration.ConfPath)
 	if err != nil {
-		log.Fatal("Error creating JSON file: ", err)
+		return err
 	}
-	defer file.Close()
 
-	encoder := json.NewEncoder(file)
-	err = encoder.Encode(s)
-	if err != nil {
-		log.Fatal("Error saving JSON file: ", err)
-	}
-}
-
-func (s *FileStorage) loadFileStatus() {
-	file, err := os.Open(s.JSONFile)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return // If file does not exist, we don't need to load it.
-		}
-		log.Fatal("Error opening JSON file: ", err)
-	}
-	defer file.Close()
-
-	decoder := json.NewDecoder(file)
-	err = decoder.Decode(s)
-	if err != nil {
-		log.Fatal("Error loading JSON file: ", err)
-	}
-}
-
-func (s *FileStorage) getFileByHash(w http.ResponseWriter, r *http.Request) {
-	vars := mux.Vars(r)
-	hash := vars["hash"]
-
-	for _, versions := range s.Files {
-		for _, fileInfo := range versions {
-			if fileInfo.Sha1 == hash || fileInfo.Md5 == hash {
-				w.Header().Set("Content-Type", "application/json")
-				json.NewEncoder(w).Encode(fileInfo)
-				return
+	for _, file := range files {
+		if !file.IsDir() && filepath.Ext(file.Name()) == ".zip" {
+			filename, data, err := ExtractFileFromZipToBytes(filepath.Join(s.Configuration.ConfPath, file.Name()))
+			fmt.Println("filename", filename)
+			if err != nil {
+				return err
 			}
+
+			_, err = s.processFile(data, filename, "", false)
+			if err != nil {
+				return err
+			}
+
 		}
 	}
-
-	http.Error(w, "File not found", http.StatusNotFound)
+	return nil
 }
 
-func (s *FileStorage) uploadFile(w http.ResponseWriter, r *http.Request) {
-	file, header, err := r.FormFile("file")
-	if err != nil {
-		http.Error(w, "Error uploading file", http.StatusBadRequest)
-		return
-	}
-	defer file.Close()
+func (s *FileStorage) processFile(input interface{}, fileName, identifier string, savefile bool) (*FileInfo, error) {
+	var (
+		data []byte
+		err  error
+	)
 
-	identifier := r.FormValue("identifier")
+	switch v := input.(type) {
+	case string:
+		savefile = true
+		data, err = os.ReadFile(v)
+		if err != nil {
+			return nil, fmt.Errorf("Error reading file: %v", err)
+		}
+	case []byte:
+		data = v
+	default:
+		return nil, fmt.Errorf("Invalid input type")
+	}
+
 	if identifier == "" {
-		http.Error(w, "Identifier is required", http.StatusBadRequest)
-		return
-	}
-
-	data, err := io.ReadAll(file)
-	if err != nil {
-		http.Error(w, "Error reading file", http.StatusInternalServerError)
-		return
+		identifier = strings.ReplaceAll(fileName, ".", "")
 	}
 
 	sha1, md5 := hashFile(data)
-	for _, fileInfo := range s.Files[identifier] {
-		if fileInfo.Sha1 == sha1 && fileInfo.Md5 == md5 {
-			http.Error(w, "File with the same hash is already stored", http.StatusBadRequest)
-			return
+	for _, fileInfo := range s.Files {
+		if fileInfo.Identifier == identifier && (fileInfo.Sha1 == sha1 || fileInfo.Md5 == md5) {
+			return nil, fmt.Errorf("File with the same hash is already stored")
 		}
 	}
 
-	compressedData, err := compressFile(data, header.Filename)
+	compressedData, err := compressFile(data, fileName)
 	if err != nil {
-		http.Error(w, "Error compressing file", http.StatusInternalServerError)
-		return
+		return nil, fmt.Errorf("Error compressing file: %v", err)
 	}
 
-	fileInfo := storeFile(s, identifier, compressedData, sha1, md5)
+	fmt.Println("storing file")
+	fileInfo := storeFile(s, identifier, compressedData, sha1, md5, savefile)
 	s.saveFileStatus()
 
-	w.WriteHeader(http.StatusOK)
-	json.NewEncoder(w).Encode(fileInfo)
+	return &fileInfo, nil
 }
 
-func compressFile(data []byte, filename string) (*bytes.Buffer, error) {
-	var buf bytes.Buffer
-	zipWriter := zip.NewWriter(&buf)
-	fileWriter, err := zipWriter.Create(filename)
-	if err != nil {
-		return nil, err
-	}
-
-	_, err = io.Copy(fileWriter, bytes.NewReader(data))
-	if err != nil {
-		return nil, err
-	}
-	err = zipWriter.Close()
-	if err != nil {
-		return nil, err
-	}
-
-	return &buf, nil
-}
-
-func storeFile(s *FileStorage, identifier string, compressedData *bytes.Buffer, sha1, md5 string) FileInfo {
+func storeFile(s *FileStorage, identifier string, compressedData *bytes.Buffer, sha1, md5 string, savefile bool) FileInfo {
 	version := 1
-	versions, exists := s.Files[identifier]
-	if exists {
-		version = len(versions) + 1
+	for _, fileInfo := range s.Files {
+		if fileInfo.Identifier == identifier {
+			if fileInfo.Version >= version {
+				version = fileInfo.Version + 1
+			}
+		}
 	}
 
 	fileInfo := FileInfo{
@@ -222,231 +183,62 @@ func storeFile(s *FileStorage, identifier string, compressedData *bytes.Buffer, 
 		Md5:        md5,
 	}
 
-	err := os.WriteFile(filepath.Join("storedconfs", fileInfo.ID+".zip"), compressedData.Bytes(), 0644)
-	if err != nil {
-		log.Fatal("Error storing file: ", err)
+	if savefile {
+		fmt.Println("saving file")
+		err := os.WriteFile(filepath.Join("storedconfs", fileInfo.ID+".zip"), compressedData.Bytes(), 0644)
+		if err != nil {
+			log.Fatal("Error storing file: ", err)
+		}
 	}
-
-	s.Files[identifier] = append(s.Files[identifier], fileInfo)
+	s.Files = append(s.Files, fileInfo)
 	return fileInfo
 }
 
 func (s *FileStorage) listFiles(w http.ResponseWriter, r *http.Request) {
-	var fileList []FileInfo
-	for _, versions := range s.Files {
-		fileList = append(fileList, versions...)
-	}
-
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(fileList)
-}
-
-func (s *FileStorage) downloadFile(w http.ResponseWriter, r *http.Request) {
-	fileInfo, err := s.getFileByVersion(r)
+	err := json.NewEncoder(w).Encode(s.Files)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusNotFound)
+		http.Error(w, "Error encoding JSON", http.StatusInternalServerError)
 		return
 	}
-
-	fileData, err := readFileContent(filepath.Join("storedconfs", fileInfo.ID+".zip"))
-	if err != nil {
-		http.Error(w, "Error reading file", http.StatusInternalServerError)
-		return
-	}
-
-	w.Header().Set("Content-Disposition", "attachment; filename="+filepath.Base(fileInfo.ID))
-	w.Header().Set("Content-Type", "application/octet-stream")
-	io.WriteString(w, fileData)
-}
-
-func (s *FileStorage) downloadFileVersion(w http.ResponseWriter, r *http.Request) {
-	fileInfo, err := s.getFileByVersion(r)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusNotFound)
-		return
-	}
-
-	fileVersion := mux.Vars(r)["version"]
-	version, err := strconv.Atoi(fileVersion)
-	if err != nil {
-		http.Error(w, "Invalid version", http.StatusBadRequest)
-		return
-	}
-
-	if fileInfo.Version != version {
-		http.Error(w, "Version not found", http.StatusNotFound)
-		return
-	}
-
-	fileData, err := readFileContent(filepath.Join("storedconfs", fileInfo.ID+".zip"))
-	if err != nil {
-		http.Error(w, "Error reading file", http.StatusInternalServerError)
-		return
-	}
-
-	w.Header().Set("Content-Disposition", "attachment; filename="+filepath.Base(fileInfo.ID))
-	w.Header().Set("Content-Type", "application/octet-stream")
-	io.WriteString(w, fileData)
-}
-
-func (s *FileStorage) showDiff(w http.ResponseWriter, r *http.Request) {
-	fileInfo1, err := s.getFileByVersion(r)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusNotFound)
-		return
-	}
-	version := fileInfo1.Version + 1
-	versions, exists := s.Files[fileInfo1.Identifier]
-	if !exists || version > len(versions) {
-		http.Error(w, "File not found", http.StatusNotFound)
-		return
-	}
-
-	fileInfo2 := versions[version-1]
-
-	fileData1, err := readFileContent(fileInfo1.ID + ".zip")
-	if err != nil {
-		http.Error(w, "Error reading file", http.StatusInternalServerError)
-		return
-	}
-
-	fileData2, err := readFileContent(fileInfo2.ID + ".zip")
-	if err != nil {
-		http.Error(w, "Error reading file", http.StatusInternalServerError)
-		return
-	}
-
-	dmp := diffmatchpatch.New()
-	diffs := dmp.DiffMain(fileData1, fileData2, false)
-	w.Header().Set("Content-Type", "text/plain")
-	io.WriteString(w, dmp.DiffPrettyText(diffs))
-
 }
 
 func (s *FileStorage) getFileByVersion(r *http.Request) (*FileInfo, error) {
 	vars := mux.Vars(r)
-	// fmt.Println(r)
 	identifier := vars["identifier"]
 	versionStr := vars["version"]
 
 	if versionStr == "" {
 		versionStr = "1"
 	}
-	// fmt.Println("ident", identifier, "ver", versionStr)
+
 	version, err := strconv.Atoi(versionStr)
 	if err != nil {
 		return nil, fmt.Errorf("invalid version")
 	}
 
-	versions, exists := s.Files[identifier]
-	if !exists || version > len(versions) {
-		return nil, fmt.Errorf("file not found")
-	}
-
-	return &versions[version-1], nil
-
-}
-
-func readFileContent(zipPath string) (string, error) {
-	zipData, err := os.ReadFile(zipPath)
-	if err != nil {
-		return "", err
-	}
-	zipReader, err := zip.NewReader(bytes.NewReader(zipData), int64(len(zipData)))
-	if err != nil {
-		return "", err
-	}
-
-	if len(zipReader.File) != 1 {
-		return "", fmt.Errorf("unexpected number of files in zip")
-	}
-
-	file := zipReader.File[0]
-	fileData, err := file.Open()
-	if err != nil {
-		return "", err
-	}
-	defer fileData.Close()
-
-	data, err := io.ReadAll(fileData)
-	if err != nil {
-		return "", err
-	}
-
-	return string(data), nil
-}
-
-func hashFile(data []byte) (string, string) {
-	sha1Hash := sha1.New()
-	sha1Hash.Write(data)
-	sha1Result := sha1Hash.Sum(nil)
-
-	md5Hash := md5.New()
-	md5Hash.Write(data)
-	md5Result := md5Hash.Sum(nil)
-
-	return hex.EncodeToString(sha1Result), hex.EncodeToString(md5Result)
-}
-
-func loadConfig() {
-	configData, err := os.ReadFile("config.json")
-	if err != nil {
-		if os.IsNotExist(err) {
-			serverConfig = ServerConfig{
-				Address:      "127.0.0.1",
-				Port:         8080,
-				ReadTimeout:  "30s",
-				WriteTimeout: "15s",
-				ConfigPath:   "config.json",
-			}
-			saveConfig()
-			return
+	for _, fileInfo := range s.Files {
+		if fileInfo.Identifier == identifier && fileInfo.Version == version {
+			return &fileInfo, nil
 		}
-		log.Fatal("Error reading config file: ", err)
 	}
 
-	err = json.Unmarshal(configData, &serverConfig)
-	if err != nil {
-		log.Fatal("Error decoding config file: ", err)
-	}
-
-	if serverConfig.Address == "" {
-		serverConfig.Address = "127.0.0.1"
-	}
-	if serverConfig.Port == 0 {
-		serverConfig.Port = 8080
-	}
-	if serverConfig.ReadTimeout == "" {
-		serverConfig.ReadTimeout = "30s"
-	} else {
-		duration, err := time.ParseDuration(serverConfig.ReadTimeout)
-		if err != nil {
-			log.Fatal("Error parsing ReadTimeout: ", err)
-		}
-		serverConfig.ReadTimeout = duration.String()
-	}
-	if serverConfig.WriteTimeout == "" {
-		serverConfig.WriteTimeout = "15s"
-	} else {
-		duration, err := time.ParseDuration(serverConfig.WriteTimeout)
-		if err != nil {
-			log.Fatal("Error parsing WriteTimeout: ", err)
-		}
-		serverConfig.WriteTimeout = duration.String()
-	}
-	if serverConfig.ConfigPath == "" {
-		serverConfig.ConfigPath = "config.json"
-	}
+	return nil, fmt.Errorf("file not found")
 }
 
-func saveConfig() {
-	configBytes, err := json.Marshal(serverConfig)
+func (s *FileStorage) deleteFile(w http.ResponseWriter, r *http.Request) {
+	fileInfo, err := s.getFileByVersion(r)
 	if err != nil {
-		log.Fatal("Error encoding config file: ", err)
+		http.Error(w, err.Error(), http.StatusNotFound)
+		return
 	}
 
-	err = os.WriteFile(serverConfig.ConfigPath, configBytes, 0644)
+	err = os.Remove(filepath.Join(s.Configuration.ConfPath, fileInfo.ID+".zip"))
 	if err != nil {
-		log.Fatal("Error writing config file: ", err)
+		fmt.Println("Error removing file: ", err)
 	}
+
+	s.removeFileInfo(fileInfo.ID)
+
+	w.WriteHeader(http.StatusOK)
 }

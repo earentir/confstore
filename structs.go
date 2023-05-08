@@ -9,14 +9,22 @@ type FileInfo struct {
 }
 
 type FileStorage struct {
-	Files    map[string][]FileInfo `json:"files"`
-	JSONFile string
+	Files         []FileInfo `json:"files"`
+	Configuration Configuration
 }
 
-type ServerConfig struct {
-	Address      string `json:"address"`
-	Port         int    `json:"port"`
-	ReadTimeout  string `json:"read_timeout"`
-	WriteTimeout string `json:"write_timeout"`
-	ConfigPath   string `json:"config_path"`
+type Configuration struct {
+	JSONFile   string `json:"json_file"`
+	ConfPath   string `json:"conf_path"`
+	ListenAddr string `json:"listen_addr"`
+	Port       string `json:"port"`
+	CertFile   string `json:"cert_file"`
+	KeyFile    string `json:"key_file"`
 }
+
+const (
+	defaultJSONFile   = "file_status.json"
+	defaultListenAddr = "127.0.0.1"
+	defaultPort       = "8080"
+	defaultConfPath   = "storedconfs"
+)
